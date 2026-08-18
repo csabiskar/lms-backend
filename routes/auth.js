@@ -44,14 +44,37 @@ router.get("/auth/callback", async (req, res) => {
     if (!storedState) return res.status(403).send("Request origin could not be verified");
     await OAuthState.deleteMany({ shop });
 
-    const { hmac: _h, signature: _s, ...rest } = req.query;
-    const message = Object.keys(rest).sort().map((k) => `${k}=${rest[k]}`).join("&");
+    // --- HMAC validation, done against the RAW query string ---
+    // Rebuilding the message from req.query (an already-decoded object) can
+    // change encoding (e.g. "+" vs "%20", or key ordering with duplicate
+    // params) and cause valid requests to fail HMAC validation. Shopify
+    // signs the raw query string it sent, so we validate against that
+    // instead of a re-serialized version.
+    const rawQuery = req.originalUrl.split("?")[1] || "";
+    const params = new URLSearchParams(rawQuery);
+    params.delete("hmac");
+    params.delete("signature");
+
+    const message = [...params.entries()]
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => `${k}=${v}`)
+      .join("&");
+
     const generatedHash = crypto
       .createHmac("sha256", process.env.SHOPIFY_API_SECRET)
       .update(message)
       .digest("hex");
 
-    if (generatedHash !== hmac) return res.status(400).send("HMAC validation failed");
+    const hmacBuffer = Buffer.from(hmac, "utf-8");
+    const generatedBuffer = Buffer.from(generatedHash, "utf-8");
+    const hmacValid =
+      hmacBuffer.length === generatedBuffer.length &&
+      crypto.timingSafeEqual(hmacBuffer, generatedBuffer);
+
+    if (!hmacValid) {
+      console.error("HMAC mismatch", { message, generatedHash, hmac });
+      return res.status(400).send("HMAC validation failed");
+    }
 
     const { data } = await axios.post(`https://${shop}/admin/oauth/access_token`, {
       client_id: process.env.SHOPIFY_API_KEY,
